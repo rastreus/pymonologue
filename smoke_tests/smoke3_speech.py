@@ -11,7 +11,13 @@ PYTHONISTA_DIR = THIS_DIR.parent / 'Pythonista'
 if str(PYTHONISTA_DIR) not in sys.path:
     sys.path.insert(0, str(PYTHONISTA_DIR))
 
-from speech_recognizer import SpeechRecognitionError, SpeechRecognizer, authorization_status
+from speech_recognizer import (
+    SpeechRecognitionError,
+    SpeechRecognizer,
+    _create_recognizer,
+    _supports_on_device_recognition,
+    authorization_status,
+)
 
 
 path = tempfile.gettempdir() + '/smoke_test.m4a'
@@ -27,6 +33,9 @@ recognizer = SpeechRecognizer()
 
 try:
     print(f'Authorization status before transcribe: {authorization_status()}')
+    native_recognizer = _create_recognizer('en-US')
+    print(f'Recognizer available: {bool(native_recognizer.isAvailable())}')
+    print(f'Supports on-device: {_supports_on_device_recognition(native_recognizer)}')
     transcript = recognizer.transcribe(path)
     print(f'Transcript: {transcript!r}')
 except SpeechRecognitionError as e:

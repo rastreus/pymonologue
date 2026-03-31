@@ -66,3 +66,10 @@ def test_result_collector_raises_speech_error_on_failure():
 
     with pytest.raises(speech_recognizer.SpeechRecognitionError):
         collector.wait_for_result(0.01)
+
+
+def test_should_require_on_device_only_when_requested_and_supported():
+    assert speech_recognizer._should_require_on_device(False, False) is False
+    assert speech_recognizer._should_require_on_device(False, True) is False
+    assert speech_recognizer._should_require_on_device(True, False) is False
+    assert speech_recognizer._should_require_on_device(True, True) is True

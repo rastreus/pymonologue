@@ -89,7 +89,20 @@ def _task_error_message(task) -> str:
     if not error:
         return "speech recognition failed"
     description = error.localizedDescription()
-    return str(description or error)
+    domain = error.domain() or "unknown-domain"
+    code = int(error.code())
+    return f"{description or error} [{domain} code={code}]"
+
+
+def _supports_on_device_recognition(recognizer) -> bool:
+    selector = objc_util.sel("supportsOnDeviceRecognition")
+    if recognizer.respondsToSelector_(selector):
+        return bool(recognizer.supportsOnDeviceRecognition())
+    return False
+
+
+def _should_require_on_device(prefer_on_device: bool, supports_on_device: bool) -> bool:
+    return bool(prefer_on_device and supports_on_device)
 
 
 def _speech_task_delegate_class():
@@ -217,6 +230,7 @@ def transcribe(
     *,
     timeout: float = DEFAULT_TRANSCRIBE_TIMEOUT,
     auth_timeout: float = DEFAULT_AUTH_TIMEOUT,
+    prefer_on_device: bool = False,
 ) -> str:
     """
     Transcribe an audio file using SFSpeechRecognizer.
@@ -233,12 +247,16 @@ def transcribe(
     recognizer = _create_recognizer(locale)
     if not recognizer or not recognizer.isAvailable():
         raise SpeechRecognitionError("speech recognizer is unavailable")
+    supports_on_device = _supports_on_device_recognition(recognizer)
 
     SFSpeechURLRecognitionRequest = objc_util.ObjCClass("SFSpeechURLRecognitionRequest")
     request = SFSpeechURLRecognitionRequest.alloc().initWithURL_(objc_util.nsurl(audio_path))
 
     requires_on_device = objc_util.sel("setRequiresOnDeviceRecognition:")
-    if request.respondsToSelector_(requires_on_device):
+    if request.respondsToSelector_(requires_on_device) and _should_require_on_device(
+        prefer_on_device,
+        supports_on_device,
+    ):
         request.setRequiresOnDeviceRecognition_(True)
 
     should_report_partial = objc_util.sel("setShouldReportPartialResults:")
@@ -284,10 +302,12 @@ class SpeechRecognizer:
         *,
         timeout: float = DEFAULT_TRANSCRIBE_TIMEOUT,
         auth_timeout: float = DEFAULT_AUTH_TIMEOUT,
+        prefer_on_device: bool = False,
     ):
         self.locale = locale
         self.timeout = timeout
         self.auth_timeout = auth_timeout
+        self.prefer_on_device = prefer_on_device
 
     def request_authorization(self) -> int:
         return request_authorization(self.auth_timeout)
@@ -298,6 +318,7 @@ class SpeechRecognizer:
             self.locale,
             timeout=self.timeout,
             auth_timeout=self.auth_timeout,
+            prefer_on_device=self.prefer_on_device,
         )
 
 
