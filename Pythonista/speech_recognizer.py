@@ -1,130 +1,194 @@
 """
 speech_recognizer.py — SFSpeechRecognizer wrapper for Pythonista.
 
-Phase 1: File-based recording.
-Records audio via sound.Recorder → saves to .m4a → transcribes via SFSpeechRecognizer.
-
-Validated on device (iPhone 11 Pro Max):
-- sound.Recorder works in keyboard context (use tempfile.gettempdir(), NOT /tmp)
-- SFSpeechRecognizer accessible via objc_util
-- NSLocale requires: NSLocale.alloc().initWithLocaleIdentifier_('en-US')
-  (objc_util.ns('en-US') returns NSTaggedPointerString — wrong type)
+Phase 1 uses file-based recording:
+`sound.Recorder` -> `.m4a` file -> `SFSpeechRecognizer` URL request.
 """
+
+from ctypes import c_long, c_void_p
+import os
+import tempfile
+import threading
+import time
 
 import objc_util
 import sound
-import os
-import tempfile
 
 
-def _create_recognizer(locale: str = 'en-US'):
+AUTH_STATUS_NOT_DETERMINED = 0
+AUTH_STATUS_DENIED = 1
+AUTH_STATUS_RESTRICTED = 2
+AUTH_STATUS_AUTHORIZED = 3
+
+DEFAULT_AUTH_TIMEOUT = 10.0
+DEFAULT_TRANSCRIBE_TIMEOUT = 20.0
+
+
+class SpeechRecognitionError(RuntimeError):
+    pass
+
+
+def _load_speech_framework():
+    objc_util.load_framework("Speech")
+
+
+def _create_recognizer(locale: str = "en-US"):
     """
     Create and return an SFSpeechRecognizer instance.
-
-    Args:
-        locale: BCP-47 locale string (e.g. 'en-US')
-
-    Returns:
-        SFSpeechRecognizer ObjC instance
     """
-    SFSpeechRecognizer = objc_util.ObjCClass('SFSpeechRecognizer')
-    NSLocale = objc_util.ObjCClass('NSLocale')
+    _load_speech_framework()
+    SFSpeechRecognizer = objc_util.ObjCClass("SFSpeechRecognizer")
+    NSLocale = objc_util.ObjCClass("NSLocale")
 
     locale_obj = NSLocale.alloc().initWithLocaleIdentifier_(locale)
-    recognizer = SFSpeechRecognizer.alloc().initWithLocale_(locale_obj)
-    return recognizer
+    return SFSpeechRecognizer.alloc().initWithLocale_(locale_obj)
 
 
-def transcribe(audio_path: str, locale: str = 'en-US') -> str:
+def _authorization_label(status: int) -> str:
+    return {
+        AUTH_STATUS_NOT_DETERMINED: "not determined",
+        AUTH_STATUS_DENIED: "denied",
+        AUTH_STATUS_RESTRICTED: "restricted",
+        AUTH_STATUS_AUTHORIZED: "authorized",
+    }.get(status, f"unknown({status})")
+
+
+def request_authorization(timeout: float = DEFAULT_AUTH_TIMEOUT) -> int:
     """
-    Transcribe an audio file using on-device SFSpeechRecognizer.
+    Request speech recognition authorization and wait for the callback.
+    """
+    _load_speech_framework()
+    SFSpeechRecognizer = objc_util.ObjCClass("SFSpeechRecognizer")
 
-    Args:
-        audio_path: Path to .m4a or .wav audio file
-        locale: BCP-47 locale string
+    event = threading.Event()
+    result = {"status": AUTH_STATUS_NOT_DETERMINED}
 
-    Returns:
-        Transcribed text string, or empty string if transcription fails
+    def _handler(_block, status):
+        result["status"] = int(status)
+        event.set()
+
+    block = objc_util.ObjCBlock(_handler, restype=None, argtypes=[c_void_p, c_long])
+    SFSpeechRecognizer.requestAuthorization_(block)
+
+    if not event.wait(timeout):
+        raise SpeechRecognitionError("speech authorization timed out")
+    return result["status"]
+
+
+def transcribe(
+    audio_path: str,
+    locale: str = "en-US",
+    *,
+    timeout: float = DEFAULT_TRANSCRIBE_TIMEOUT,
+    auth_timeout: float = DEFAULT_AUTH_TIMEOUT,
+) -> str:
+    """
+    Transcribe an audio file using SFSpeechRecognizer.
     """
     if not os.path.exists(audio_path):
-        return ''
+        return ""
+
+    status = request_authorization(auth_timeout)
+    if status != AUTH_STATUS_AUTHORIZED:
+        raise SpeechRecognitionError(
+            f"speech recognition authorization is {_authorization_label(status)}"
+        )
 
     recognizer = _create_recognizer(locale)
-    if not recognizer.isAvailable():
-        return ''
+    if not recognizer or not recognizer.isAvailable():
+        raise SpeechRecognitionError("speech recognizer is unavailable")
 
-    NSURL = objc_util.ObjCClass('NSURL')
-    SFSpeechURLRecognitionRequest = objc_util.ObjCClass('SFSpeechURLRecognitionRequest')
+    SFSpeechURLRecognitionRequest = objc_util.ObjCClass("SFSpeechURLRecognitionRequest")
+    request = SFSpeechURLRecognitionRequest.alloc().initWithURL_(objc_util.nsurl(audio_path))
 
-    url = NSURL.fileURLWithPath_(audio_path)
-    request = SFSpeechURLRecognitionRequest.alloc().init()
-    request.setURL_(url)
-    request.setRequestsOnDeviceRecognition_(True)
+    requires_on_device = objc_util.sel("setRequiresOnDeviceRecognition:")
+    if request.respondsToSelector_(requires_on_device):
+        request.setRequiresOnDeviceRecognition_(True)
 
-    # recognitionTaskWithRequest_ is async delegate-based.
-    # For Phase 1 we use SFSpeechURLRecognitionRequest which can give
-    # a synchronous result for short files.
-    result = recognizer.recognitionTaskWithRequest_(request)
+    event = threading.Event()
+    result_holder = {"text": "", "error": None}
 
-    if result:
-        best = result.bestTranscription()
-        if best:
-            return str(best.formattedString())
+    def _result_handler(_block, result_ptr, error_ptr):
+        if error_ptr:
+            error = objc_util.ObjCInstance(error_ptr)
+            description = error.localizedDescription()
+            result_holder["error"] = str(description or error)
+            event.set()
+            return
 
-    return ''
+        if not result_ptr:
+            return
+
+        result = objc_util.ObjCInstance(result_ptr)
+        transcription = result.bestTranscription()
+        if transcription:
+            result_holder["text"] = str(transcription.formattedString())
+        if bool(result.isFinal()):
+            event.set()
+
+    result_block = objc_util.ObjCBlock(
+        _result_handler,
+        restype=None,
+        argtypes=[c_void_p, c_void_p, c_void_p],
+    )
+    task = recognizer.recognitionTaskWithRequest_resultHandler_(request, result_block)
+
+    if not event.wait(timeout):
+        if task is not None:
+            task.cancel()
+        raise SpeechRecognitionError("speech transcription timed out")
+
+    if result_holder["error"]:
+        raise SpeechRecognitionError(result_holder["error"])
+
+    return result_holder["text"]
 
 
-def record_audio(duration: float = 3.0, suffix: str = '.m4a') -> str:
+def record_audio(duration: float = 3.0, suffix: str = ".m4a") -> str:
     """
     Record audio to a temp file using sound.Recorder.
-
-    IMPORTANT: Use tempfile.gettempdir() for the path — /tmp is NOT writable
-    in the Pythonista keyboard extension sandbox.
-
-    Args:
-        duration: Recording duration in seconds
-        suffix: File suffix (.m4a or .wav)
-
-    Returns:
-        Path to the recorded audio file
     """
-    path = tempfile.gettempdir() + '/pymonologue_rec' + suffix
+    path = tempfile.gettempdir() + "/pymonologue_rec" + suffix
     recorder = sound.Recorder(path)
     recorder.record()
-    import time
     time.sleep(duration)
     recorder.stop()
     return path
 
 
-# --- Convenience API (main entry point for keyboard) ---
-
-
 class SpeechRecognizer:
     """
-    Wrapper around SFSpeechRecognizer for file-based transcription.
-
-    Usage:
-        recognizer = SpeechRecognizer()
-        path = record_audio(duration=3.0)
-        transcript = recognizer.transcribe(path)
+    Convenience wrapper around the module-level transcription helpers.
     """
 
-    def __init__(self, locale: str = 'en-US'):
+    def __init__(
+        self,
+        locale: str = "en-US",
+        *,
+        timeout: float = DEFAULT_TRANSCRIBE_TIMEOUT,
+        auth_timeout: float = DEFAULT_AUTH_TIMEOUT,
+    ):
         self.locale = locale
-        self._recognizer = None
+        self.timeout = timeout
+        self.auth_timeout = auth_timeout
+
+    def request_authorization(self) -> int:
+        return request_authorization(self.auth_timeout)
 
     def transcribe(self, audio_path: str) -> str:
-        """Transcribe an audio file."""
-        return transcribe(audio_path, self.locale)
+        return transcribe(
+            audio_path,
+            self.locale,
+            timeout=self.timeout,
+            auth_timeout=self.auth_timeout,
+        )
 
 
-if __name__ == '__main__':
-    # Quick smoke test
-    print('Recording 3s...')
+if __name__ == "__main__":
+    print("Recording 3s...")
     path = record_audio(3.0)
-    print(f'Recorded: {path}, exists: {os.path.exists(path)}')
+    print(f"Recorded: {path}, exists: {os.path.exists(path)}")
 
-    print('Transcribing...')
+    print("Transcribing...")
     text = transcribe(path)
-    print(f'Transcript: {text}')
+    print(f"Transcript: {text}")

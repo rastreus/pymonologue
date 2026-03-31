@@ -9,13 +9,21 @@ except ImportError:
 
 
 class PunctuationRow(ui.View):
-    def __init__(self, symbols=None, *args, **kwargs):
+    def __init__(self, symbols=None, on_insert=None, on_backspace=None, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.symbols = list(symbols or ('.', ',', '?', '!', "'"))
-        self.flex = 'W'
-        self.background_color = 'clear'
+        self.symbols = list(symbols or (".", ",", "?", "!", "'", "⌫"))
+        self.on_insert = on_insert
+        self.on_backspace = on_backspace
+        self.flex = "W"
+        self.background_color = "clear"
         self.buttons = []
+        self.set_symbols(self.symbols)
 
+    def set_symbols(self, symbols):
+        self.symbols = list(symbols)
+        for button in self.buttons:
+            button.remove_from_superview()
+        self.buttons = []
         for symbol in self.symbols:
             button = ui.Button(title=symbol)
             button.background_color = keyboard_style.DARK_BG_3
@@ -25,6 +33,7 @@ class PunctuationRow(ui.View):
             button.action = self._insert_symbol
             self.buttons.append(button)
             self.add_subview(button)
+        self.set_needs_layout()
 
     def layout(self):
         if not self.buttons:
@@ -37,7 +46,18 @@ class PunctuationRow(ui.View):
             button.frame = (x, 0, width, self.height)
 
     def _insert_symbol(self, sender):
-        if keyboard is not None:
-            if hasattr(keyboard, 'play_input_click'):
-                keyboard.play_input_click()
-            keyboard.insert_text(sender.title)
+        if keyboard is not None and hasattr(keyboard, 'play_input_click'):
+            keyboard.play_input_click()
+
+        title = sender.title
+        if title == "⌫":
+            if callable(self.on_backspace):
+                self.on_backspace()
+            elif keyboard is not None:
+                keyboard.backspace()
+            return
+
+        if callable(self.on_insert):
+            self.on_insert(title)
+        elif keyboard is not None:
+            keyboard.insert_text(title)

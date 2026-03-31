@@ -18,6 +18,10 @@ class TagSelectorView(ui.View):
         self.panel.border_color = keyboard_style.FG_DARK_GRAY
         self.add_subview(self.panel)
 
+        self.scroll = ui.ScrollView()
+        self.scroll.shows_vertical_scroll_indicator = True
+        self.panel.add_subview(self.scroll)
+
         self.title_label = self._make_label('Tag Context', keyboard_style.FONT_SIZE_LARGE)
         self.projects_label = self._make_label('Recent Projects', keyboard_style.FONT_SIZE_SMALL)
         self.tasks_label = self._make_label('Recent Tasks', keyboard_style.FONT_SIZE_SMALL)
@@ -64,14 +68,15 @@ class TagSelectorView(ui.View):
             *self.project_buttons,
             *self.task_buttons,
         ]:
-            self.panel.add_subview(subview)
+            self.scroll.add_subview(subview)
 
         self._refresh_button_states()
 
     def layout(self):
-        panel_width = min(max(self.width - 24, 280), 360)
-        panel_height = min(max(self.height - 40, 280), 360)
+        panel_width = min(max(self.width - 24, 240), 320)
+        panel_height = min(max(self.height - 16, 160), 220)
         self.panel.frame = ((self.width - panel_width) / 2.0, (self.height - panel_height) / 2.0, panel_width, panel_height)
+        self.scroll.frame = self.panel.bounds
 
         inset = 16
         width = self.panel.width - (inset * 2)
@@ -101,6 +106,7 @@ class TagSelectorView(ui.View):
         button_width = (width - 10) / 2.0
         self.clear_button.frame = (inset, y, button_width, 38)
         self.done_button.frame = (inset + button_width + 10, y, button_width, 38)
+        self.scroll.content_size = (self.scroll.width, y + 52)
 
     def touch_began(self, touch):
         x, y = touch.location

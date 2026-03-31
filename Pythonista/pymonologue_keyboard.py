@@ -1,227 +1,279 @@
 """
 pymonologue_keyboard.py — PyMonologue custom keyboard for Pythonista.
 
-This script runs resident in the Pythonista keyboard context.
-Pythonista loads the module, executes it, and keeps it alive.
-keyboard.set_view() MUST be called at load time (not behind __main__).
-
-Reference: https://omz-software.com/pythonista/docs-3.4/py3/ios/keyboard.html
+When running inside the Pythonista keyboard, this installs the custom input
+view immediately. When run as a normal script inside Pythonista, it presents a
+preview harness that exercises the same workflow against a local text pane.
 """
+
+from pathlib import Path
+import sys
+import tempfile
 
 import keyboard
 import ui
 
-# ─── Check environment ───────────────────────────────────────────────────────
 
-_is_keyboard_context = keyboard.is_keyboard()
+_THIS_DIR = Path(__file__).resolve().parent
+_UI_DIR = _THIS_DIR / "ui"
+if str(_UI_DIR) not in sys.path:
+    sys.path.insert(0, str(_UI_DIR))
 
-if _is_keyboard_context:
-    # Running inside the Pythonista keyboard extension.
-    # Build and install the custom UI immediately.
-    import sys
-    from pathlib import Path
+import auto_dictionary
+import context_tags
+import keyboard_style
+import sound
+import speech_recognizer
+from keyboard_shell import PhaseOneKeyboardView
+from modes_menu import ModesMenuView
+from slash_menu import SlashMenuView
+from tag_selector import TagSelectorView
+from voice_workflow import VoiceWorkflowController
 
-    _THIS_DIR = Path(__file__).resolve().parent
-    _UI_DIR = _THIS_DIR / 'ui'
-    if str(_UI_DIR) not in sys.path:
-        sys.path.insert(0, str(_UI_DIR))
 
-    import sound
-    import tempfile
+def _documents_path(filename: str) -> str:
+    candidate = Path.home() / "Documents" / filename
+    if candidate.parent.exists():
+        return str(candidate)
+    return str(_THIS_DIR / filename)
 
-    import auto_dictionary
-    import context_tags
-    import speech_recognizer
-    import text_normalizer
-    import keyboard_style
-    from punctuation_row import PunctuationRow
-    from slash_menu import SlashMenuView
-    from tag_selector import TagSelectorView
-    from voice_button import VoiceButton
 
-    _tag_context = context_tags.TagContext()
-    _is_recording = False
-    _current_recorder = None
-    _keyboard_view = None
+class PythonistaRecorder:
+    def __init__(self):
+        self._recorder = None
+        self._audio_path = ""
 
-    # ─── View ───────────────────────────────────────────────────────────────
+    def start(self, path: str):
+        self._audio_path = path
+        self._recorder = sound.Recorder(path)
+        self._recorder.record()
 
-    class PyMonologueKeyboardView(ui.View):
-        """Custom keyboard view — replaces QWERTY area in 'expanded' mode."""
+    def stop(self):
+        if self._recorder is None:
+            return self._audio_path
+        self._recorder.stop()
+        self._recorder = None
+        return self._audio_path
 
-        def __init__(self):
-            super().__init__(frame=(0, 0, 320, keyboard_style.KEYBOARD_HEIGHT))
-            self.flex = 'WH'
-            self.background_color = keyboard_style.DARK_BG
-            self.name = 'PyMonologue'
-            self.active_overlay = None
 
-            # Row 1: TAGS, /, [punctuations]
-            self.tags_button = self._make_button('TAGS', self._on_tags_tap)
-            self.slash_button = self._make_button('/', self._on_slash_tap)
-            self.punctuation_row = PunctuationRow()
-
-            # Center: voice button
-            self.voice_button = VoiceButton(action=self._on_voice_tap)
-
-            # Row 3: ABC | SPACE | return
-            self.abc_button = self._make_button('ABC', self._on_abc_tap)
-            self.space_button = self._make_button('M', self._on_space_tap)
-            self.return_button = self._make_button('return', self._on_return_tap)
-
-            for sv in [
-                self.tags_button,
-                self.slash_button,
-                self.punctuation_row,
-                self.voice_button,
-                self.abc_button,
-                self.space_button,
-                self.return_button,
-            ]:
-                self.add_subview(sv)
-
-        # ── Keyboard callbacks (kb_* prefix — called by Pythonista) ─────────
-
-        def kb_should_insert(self, text):
-            """Called when QWERTY keys would insert text."""
-            return text  # pass through
-
-        def kb_text_changed(self):
-            """Called when document text changes."""
-            pass
-
-        def kb_should_delete(self):
-            """Called when backspace would fire."""
-            return True
-
-        # ── Layout ─────────────────────────────────────────────────────────
-
-        def layout(self):
-            w = self.width or 320
-            h = self.height or keyboard_style.KEYBOARD_HEIGHT
-            pad = 12
-            row1_h = 34
-            row3_h = 44
-
-            # Row 1
-            self.tags_button.frame = (pad, 10, 70, row1_h)
-            self.slash_button.frame = (self.tags_button.x + self.tags_button.width + 8, 10, 32, row1_h)
-            punct_w = min(210, w * 0.52)
-            self.punctuation_row.frame = (w - pad - punct_w, 10, punct_w, row1_h)
-
-            # Center: voice button
-            voice_w = min(w - pad * 2, 248)
-            voice_h = min(124, max(96, h - 120))
-            self.voice_button.frame = ((w - voice_w) / 2.0, 58, voice_w, voice_h)
-
-            # Row 3
-            row3_y = h - row3_h - 12
-            self.abc_button.frame = (pad, row3_y, 64, row3_h)
-            self.return_button.frame = (w - pad - 82, row3_y, 82, row3_h)
-            space_x = self.abc_button.x + self.abc_button.width + 10
-            self.space_button.frame = (space_x, row3_y, self.return_button.x - 10 - space_x, row3_h)
-
-            if self.active_overlay is not None:
-                self.active_overlay.frame = self.bounds
-
-        # ── Overlay helpers ─────────────────────────────────────────────────
-
-        def show_overlay(self, overlay):
-            if self.active_overlay is not None:
-                self.active_overlay.remove_from_superview()
-            self.active_overlay = overlay
-            overlay.frame = self.bounds
-            overlay.flex = 'WH'
-            self.add_subview(overlay)
-            self.bring_to_front(overlay)
-
-        def clear_overlay(self):
-            self.active_overlay = None
-
-        # ── Button helpers ─────────────────────────────────────────────────
-
-        def _make_button(self, title, action):
-            b = ui.Button(title=title)
-            b.background_color = keyboard_style.DARK_BG_3
-            b.tint_color = keyboard_style.FG_WHITE
-            b.corner_radius = keyboard_style.BUTTON_RADIUS
-            b.font = (keyboard_style.FONT_BOLD, keyboard_style.FONT_SIZE_SMALL)
-            b.action = action
-            return b
-
-        # ── Button actions ──────────────────────────────────────────────────
-
-        def _on_voice_tap(self, sender):
-            _on_voice_button_tap()
-
-        def _on_tags_tap(self, sender):
-            selector = TagSelectorView(_tag_context, on_dismiss=self.clear_overlay)
-            self.show_overlay(selector)
-
-        def _on_slash_tap(self, sender):
-            menu = SlashMenuView(on_dismiss=self.clear_overlay)
-            self.show_overlay(menu)
-
-        def _on_abc_tap(self, sender):
-            if hasattr(keyboard, 'set_view'):
-                keyboard.set_view(None)
-
-        def _on_space_tap(self, sender):
-            _insert_text(' ')
-
-        def _on_return_tap(self, sender):
-            _insert_text('\n')
-
-    # ─── Voice pipeline ─────────────────────────────────────────────────────
-
-    def _on_voice_button_tap():
-        global _is_recording, _current_recorder
-
-        if not _is_recording:
-            _is_recording = True
-            audio_path = tempfile.gettempdir() + '/pymonologue_rec.m4a'
-            _current_recorder = sound.Recorder(audio_path)
-            _current_recorder.record()
-            _keyboard_view.voice_button.set_recording(True)
-        else:
-            _is_recording = False
-            _keyboard_view.voice_button.set_recording(False)
-
-            audio_path = tempfile.gettempdir() + '/pymonologue_rec.m4a'
-            recognizer = speech_recognizer.SpeechRecognizer()
-            raw_text = recognizer.transcribe(audio_path)
-
-            if not raw_text:
-                raw_text = '(no speech detected)'
-
-            cleaned = text_normalizer.normalize(raw_text)
-            auto_dictionary.process_transcription(cleaned)
-            final_text = context_tags.prepend_tags(cleaned, _tag_context.get_current_tags())
-            _insert_text(final_text)
-
-    def _insert_text(text):
-        if hasattr(keyboard, 'play_input_click'):
+class KeyboardTextSink:
+    def insert(self, text: str):
+        if hasattr(keyboard, "play_input_click"):
             keyboard.play_input_click()
         keyboard.insert_text(text)
 
-    # ─── Install keyboard UI ─────────────────────────────────────────────────
+    def backspace(self):
+        if hasattr(keyboard, "play_input_click"):
+            keyboard.play_input_click()
+        keyboard.backspace()
 
-    _keyboard_view = PyMonologueKeyboardView()
-    keyboard.set_view(_keyboard_view, mode='expanded')
 
-# ─── Not in keyboard context ────────────────────────────────────────────────
-# Running as a normal script (e.g., from the editor).
-# Show a setup guide instead.
+class PreviewOutputView(ui.View):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.background_color = keyboard_style.PANEL_BG
+        self.corner_radius = 14
 
-else:
-    print('PyMonologue Keyboard')
-    print('=' * 40)
-    print('This script is a Pythonista custom keyboard.')
-    print()
-    print('To use it:')
-    print('1. Settings → General → Keyboard → Keyboards')
-    print('2. Add New Keyboard → Pythonista')
-    print('3. Enable Full Access (required for microphone)')
-    print('4. Open Pythonista → Settings → Keyboards')
-    print('5. Add this script as a Script Shortcut')
-    print('6. In any app, tap the shortcut to activate')
+        self.title_label = ui.Label()
+        self.title_label.text = "Preview Output"
+        self.title_label.text_color = keyboard_style.FG_GRAY
+        self.title_label.font = (keyboard_style.FONT_BOLD, keyboard_style.FONT_SIZE_SMALL)
+        self.title_label.alignment = ui.ALIGN_CENTER
+
+        self.text_view = ui.TextView()
+        self.text_view.background_color = keyboard_style.DARK_BG_2
+        self.text_view.text_color = keyboard_style.FG_WHITE
+        self.text_view.font = (keyboard_style.FONT_REGULAR, keyboard_style.FONT_SIZE_MEDIUM)
+        self.text_view.editable = False
+
+        self.placeholder_label = ui.Label()
+        self.placeholder_label.text = "Run the keyboard here without switching apps."
+        self.placeholder_label.text_color = keyboard_style.FG_DARK_GRAY
+        self.placeholder_label.font = (keyboard_style.FONT_REGULAR, keyboard_style.FONT_SIZE_SMALL)
+        self.placeholder_label.alignment = ui.ALIGN_CENTER
+        self.placeholder_label.number_of_lines = 0
+        self.placeholder_label.touch_enabled = False
+
+        for subview in [self.title_label, self.text_view, self.placeholder_label]:
+            self.add_subview(subview)
+
+    def layout(self):
+        pad = 10
+        self.title_label.frame = (pad, 8, self.width - pad * 2, 16)
+        self.text_view.frame = (pad, 30, self.width - pad * 2, self.height - 40)
+        self.placeholder_label.frame = (
+            self.text_view.x + 8,
+            self.text_view.y + 24,
+            self.text_view.width - 16,
+            40,
+        )
+
+    def insert_text(self, text: str):
+        self.text_view.text = (self.text_view.text or "") + text
+        self._sync_placeholder()
+
+    def backspace(self):
+        current = self.text_view.text or ""
+        self.text_view.text = current[:-1]
+        self._sync_placeholder()
+
+    def clear(self):
+        self.text_view.text = ""
+        self._sync_placeholder()
+
+    def _sync_placeholder(self):
+        self.placeholder_label.hidden = bool(self.text_view.text)
+
+
+class PreviewTextSink:
+    def __init__(self, preview_output: PreviewOutputView):
+        self.preview_output = preview_output
+
+    def insert(self, text: str):
+        self.preview_output.insert_text(text)
+
+    def backspace(self):
+        self.preview_output.backspace()
+
+
+class DictionaryStore:
+    def __init__(self, path: str):
+        self.path = path
+        self.dictionary = auto_dictionary.load_dictionary(path)
+
+    def process(self, text: str, current_dictionary):
+        dictionary = current_dictionary or self.dictionary
+        dictionary, suggestions = auto_dictionary.process_transcription(text, dictionary)
+        self.dictionary = dictionary
+        auto_dictionary.save_dictionary(dictionary, self.path)
+        return dictionary, suggestions
+
+
+class PyMonologueCoordinator:
+    def __init__(self, is_keyboard_context: bool):
+        self.is_keyboard_context = is_keyboard_context
+        self.tag_storage_path = _documents_path(context_tags.DEFAULT_STORAGE_PATH)
+        self.dictionary_store = DictionaryStore(_documents_path(auto_dictionary.DEFAULT_DICT_PATH))
+        self.tag_context = context_tags.TagContext(
+            tags=context_tags.load_tags(self.tag_storage_path)
+        )
+        self.preview_output = None if is_keyboard_context else PreviewOutputView()
+        self.text_sink = KeyboardTextSink() if is_keyboard_context else PreviewTextSink(self.preview_output)
+        self.recorder = PythonistaRecorder()
+        self.transcriber = speech_recognizer.SpeechRecognizer()
+        self.controller = VoiceWorkflowController(
+            recorder=self.recorder,
+            transcriber=self.transcriber,
+            insert_text=self.text_sink.insert,
+            audio_path_factory=self._audio_path,
+            tag_text=self._prepend_tags,
+            process_dictionary=self.dictionary_store.process,
+        )
+        self.view = PhaseOneKeyboardView(
+            self._handle_mode_tap,
+            self._handle_voice_tap,
+            self._handle_space_tap,
+            self._handle_return_tap,
+            self._handle_backspace_tap,
+            self._handle_punctuation_tap,
+            self._handle_abc_tap,
+            preview_output_view=self.preview_output,
+            initial_model=self.controller.build_view_model(),
+            frame=(0, 0, 320, self._view_height()),
+        )
+        self.view.name = "PyMonologue"
+
+    def install(self):
+        if self.is_keyboard_context:
+            keyboard.set_view(self.view, mode="expanded")
+        else:
+            self.view.present("sheet", hide_title_bar=True)
+
+    def _view_height(self):
+        if self.is_keyboard_context:
+            return keyboard_style.KEYBOARD_HEIGHT
+        return keyboard_style.KEYBOARD_HEIGHT + 132
+
+    def _audio_path(self):
+        return tempfile.gettempdir() + "/pymonologue_rec.m4a"
+
+    def _prepend_tags(self, text: str) -> str:
+        return context_tags.prepend_tags(text, self.tag_context.get_current_tags())
+
+    def _save_tags(self):
+        context_tags.save_tags(self.tag_context.tags, self.tag_storage_path)
+
+    def _refresh_view(self):
+        self.view.apply_view_model(self.controller.build_view_model())
+
+    def _show_overlay(self, overlay):
+        self.view.show_overlay(overlay)
+
+    def _handle_mode_tap(self, sender):
+        menu = ModesMenuView(on_select=self._handle_mode_selection, on_dismiss=self.view.clear_overlay)
+        self._show_overlay(menu)
+
+    def _handle_mode_selection(self, selection: str):
+        if selection == "tags":
+            selector = TagSelectorView(self.tag_context, on_dismiss=self._dismiss_tag_selector)
+            self._show_overlay(selector)
+            return
+
+        if selection == "slash":
+            menu = SlashMenuView(on_dismiss=self.view.clear_overlay)
+            self._show_overlay(menu)
+            return
+
+        if selection == "clear_tags":
+            self.tag_context.set_project(None)
+            self.tag_context.set_task(None)
+            self.tag_context.set_priority("normal")
+            self.tag_context.set_note(None)
+            self._save_tags()
+
+    def _dismiss_tag_selector(self):
+        self._save_tags()
+        self.view.clear_overlay()
+
+    @ui.in_background
+    def _handle_voice_tap(self, sender):
+        if self.controller.state == "idle":
+            self.controller.start_recording()
+            self._refresh_view()
+            return
+
+        if self.controller.state != "recording":
+            return
+
+        audio_path = self.controller.stop_recording()
+        self._refresh_view()
+        try:
+            self.controller.complete_transcription(audio_path)
+        except Exception as exc:
+            self.controller.last_error = str(exc)
+        self._refresh_view()
+
+    def _handle_space_tap(self, sender):
+        self.text_sink.insert(" ")
+
+    def _handle_return_tap(self, sender):
+        self.text_sink.insert("\n")
+
+    def _handle_backspace_tap(self):
+        self.text_sink.backspace()
+
+    def _handle_punctuation_tap(self, text: str):
+        self.text_sink.insert(text)
+
+    def _handle_abc_tap(self, sender):
+        if self.is_keyboard_context:
+            keyboard.set_view(None, mode="expanded")
+        elif self.preview_output is not None:
+            self.preview_output.clear()
+            self.controller.last_error = ""
+            self._refresh_view()
+
+
+_is_keyboard_context = keyboard.is_keyboard()
+_coordinator = PyMonologueCoordinator(_is_keyboard_context)
+_coordinator.install()
