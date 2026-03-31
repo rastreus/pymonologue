@@ -6,6 +6,8 @@ PyMonologue is a voice-first custom keyboard for iOS, built in Pythonista 3. Tap
 
 The current product and implementation reference lives in [`docs/monologue-pythonista.md`](./docs/monologue-pythonista.md).
 
+![Norm using PyMonologue](./images/norm_pymonologue.png)
+
 ## Active Architecture
 
 Two voice input approaches exist:
